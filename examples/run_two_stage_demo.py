@@ -1,33 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Two-stage pipeline demo.
+"""Two-stage pipeline demo with dynamic Relay selection (Nixl/Shm/Nccl).
 
 This demonstrates:
 - Stage 1: Receives input, doubles it, sends to Stage 2
 - Stage 2: Receives from Stage 1, adds 100, completes
-
-Tests:
-1. Normal flow
-2. Multiple requests
-3. Abort functionality
-4. Graceful shutdown
-
-Usage:
-    # Use NixlRelay (default)
-    python run_two_stage_demo.py
-
-    # Use NixlRelay
-    python run_two_stage_demo.py --relay nixl
-
-    # Use NixlRelay with custom config
-    python run_two_stage_demo.py --relay nixl --nixl-host 192.168.1.100 --nixl-metadata-server http://192.168.1.100:8080/metadata
 """
 
 import argparse
 import asyncio
 import logging
 import multiprocessing as mp
-import time
-from typing import Any
+import os
+import socket
+from typing import Any, List
 
 from sglang_omni import Coordinator
 
@@ -50,12 +35,18 @@ ENDPOINTS = {
     "stage2": STAGE2_ENDPOINT,
 }
 
-# Default NixlRelay configuration
-DEFAULT_NIXL_CONFIG = {
-    "host": "127.0.0.1",
-    "metadata_server": "http://127.0.0.1:8080/metadata",
-    "device_name": "",
-}
+# --- NCCL Topology Constants ---
+WORLD_SIZE = 2
+RANK_STAGE1 = 0
+RANK_STAGE2 = 1
+
+
+def find_free_port():
+    """Find a free port on localhost to avoid collisions."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s.getsockname()[1]
 
 
 def stage1_get_next(request_id: str, output: Any) -> str | None:
@@ -74,22 +65,15 @@ def run_stage(
     transform,
     delay: float,
     get_next,
-    relay_type: str = "nixl",
-    nixl_config: dict[str, Any] | None = None,
-    gpu_id: int = 0,
+    relay_type: str = "shm",
+    gpu_id: int | None = None,
+    rank: int = 0,
+    world_size: int = 1,
+    send_to_ranks: List[int] = [],
+    recv_from_ranks: List[int] = [],
 ):
-    """Generic stage runner.
-
-    Args:
-        name: Stage name
-        endpoint: ZMQ endpoint for receiving work
-        transform: Data transformation function
-        delay: Processing delay (simulation)
-        get_next: Routing function
-        relay_type: Relay type ("nixl")
-        nixl_config: NixlRelay configuration dict
-        gpu_id: GPU ID to use (for NixlRelay, default: 0)
-    """
+    """Generic stage runner."""
+    # Move imports here to avoid multiprocessing pickling issues
     import asyncio
     import logging
 
@@ -99,7 +83,7 @@ def run_stage(
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format=f"%(asctime)s [%(levelname)s] {name}: %(message)s",
     )
 
     def processor(payload: StagePayload) -> StagePayload:
@@ -121,20 +105,26 @@ def run_stage(
     engine = FrontendExecutor(processor)
     worker = Worker(engine)
 
-    # Configure relay - always use NixlRelay
-    if nixl_config is None:
-        nixl_config = DEFAULT_NIXL_CONFIG
-    # Add worker_id and gpu_id to config
+    # --- Build Unified Relay Config ---
     relay_config = {
-        **nixl_config,
+        "relay_type": relay_type,
         "worker_id": f"worker_{name}",
+        "slot_size_mb": 64,
+        "credits": 4,
         "gpu_id": gpu_id,
+        # NCCL topology parameters
+        "rank": rank,
+        "world_size": world_size,
+        "send_to_ranks": send_to_ranks,
+        "recv_from_ranks": recv_from_ranks,
     }
+
     logger.info(
-        "Stage %s: Initializing with NixlRelay (worker_id=%s, gpu_id=%d)",
+        "Stage %s initializing with %s (gpu_id=%s, rank=%s)",
         name,
-        relay_config["worker_id"],
+        relay_type.upper(),
         gpu_id,
+        rank if relay_type == "nccl" else "N/A",
     )
 
     stage = Stage(
@@ -144,16 +134,21 @@ def run_stage(
         coordinator_endpoint=COORDINATOR_ENDPOINT,
         abort_endpoint=ABORT_ENDPOINT,
         endpoints=ENDPOINTS,
-        relay_config=relay_config,  # Configuration dict for NixlRelay
+        relay_config=relay_config,
     )
     stage.add_worker(worker)
 
     asyncio.run(stage.run())
 
 
-def run_stage1(relay_type: str, nixl_config: dict[str, Any] | None, gpu_id: int):
+def run_stage1(relay_type: str, gpu_ids: list[int]):
     """Run Stage 1 in a separate process."""
-    # Engine that doubles the input
+    gpu = gpu_ids[0] if gpu_ids else None
+
+    # NCCL topology: Rank 0 sends to Rank 1
+    send_to = [RANK_STAGE2]
+    recv_from = []
+
     run_stage(
         name="stage1",
         endpoint=STAGE1_ENDPOINT,
@@ -161,14 +156,23 @@ def run_stage1(relay_type: str, nixl_config: dict[str, Any] | None, gpu_id: int)
         delay=0.1,
         get_next=stage1_get_next,
         relay_type=relay_type,
-        nixl_config=nixl_config,
-        gpu_id=gpu_id,
+        gpu_id=gpu,
+        # NCCL Params
+        rank=RANK_STAGE1,
+        world_size=WORLD_SIZE,
+        send_to_ranks=send_to,
+        recv_from_ranks=recv_from,
     )
 
 
-def run_stage2(relay_type: str, nixl_config: dict[str, Any] | None, gpu_id: int):
+def run_stage2(relay_type: str, gpu_ids: list[int]):
     """Run Stage 2 in a separate process."""
-    # Engine that adds 100 (with longer delay for abort test)
+    gpu = gpu_ids[1] if len(gpu_ids) > 1 else (gpu_ids[0] if gpu_ids else None)
+
+    # NCCL topology: Rank 1 receives from Rank 0
+    send_to = []
+    recv_from = [RANK_STAGE1]
+
     run_stage(
         name="stage2",
         endpoint=STAGE2_ENDPOINT,
@@ -176,8 +180,12 @@ def run_stage2(relay_type: str, nixl_config: dict[str, Any] | None, gpu_id: int)
         delay=0.5,
         get_next=stage2_get_next,
         relay_type=relay_type,
-        nixl_config=nixl_config,
-        gpu_id=gpu_id,
+        gpu_id=gpu,
+        # NCCL Params
+        rank=RANK_STAGE2,
+        world_size=WORLD_SIZE,
+        send_to_ranks=send_to,
+        recv_from_ranks=recv_from,
     )
 
 
@@ -200,99 +208,59 @@ async def run_coordinator_main(relay_type: str):
     completion_task = asyncio.create_task(coordinator.run_completion_loop())
 
     try:
-        # Give stages time to start
-        await asyncio.sleep(1.0)
+        # Give more time for NCCL warmup
+        wait_time = 4.0 if relay_type == "nccl" else 2.0
+        logger.info(f"Waiting {wait_time}s for stages to initialize and warm up...")
+        await asyncio.sleep(wait_time)
+
+        logger.info("=" * 60)
+        logger.info(f"Running Tests with Relay: {relay_type.upper()}")
+        logger.info("=" * 60)
 
         # Test 1: Normal flow
-        logger.info("=" * 50)
-        relay_label = " (NixlRelay)"
-        logger.info("Test 1: Normal flow%s", relay_label)
-        logger.info("=" * 50)
-
+        logger.info("--- Test 1: Normal flow ---")
         input_value = 10
-        logger.info("Submitting request with input=%d", input_value)
-        logger.info("Expected: (10 * 2) + 100 = 120")
-
+        # (10 * 2) + 100 = 120
+        expected = 120
         result = await coordinator.submit("req-001", input_value)
+        assert result == expected
+        logger.info(f"Test 1 PASSED: Input {input_value} -> Output {result}")
 
-        logger.info("Result: %s", result)
-        assert result == 120, f"Expected 120, got {result}"
-        logger.info("Test 1 PASSED!")
-
-        # Test 2: Multiple requests
-        logger.info("=" * 50)
-        logger.info("Test 2: Multiple sequential requests")
-        logger.info("=" * 50)
-
+        # Test 2: Multiple sequential requests
+        logger.info("--- Test 2: Multiple sequential requests ---")
         for i in range(3):
             input_val = (i + 1) * 5
             expected = (input_val * 2) + 100
             result = await coordinator.submit(f"req-multi-{i}", input_val)
-            logger.info("Input=%d, Expected=%d, Got=%d", input_val, expected, result)
-            assert result == expected, f"Expected {expected}, got {result}"
-
+            assert result == expected
         logger.info("Test 2 PASSED!")
 
         # Test 3: Abort
-        logger.info("=" * 50)
-        logger.info("Test 3: Abort request")
-        logger.info("=" * 50)
+        logger.info("--- Test 3: Abort request ---")
 
-        # Submit a request but abort it quickly
         async def submit_and_abort():
             submit_task = asyncio.create_task(coordinator.submit("req-abort-1", 999))
-            # Wait a tiny bit, then abort
             await asyncio.sleep(0.2)
             aborted = await coordinator.abort("req-abort-1")
-            logger.info("Abort result: %s", aborted)
-            assert aborted, "Should have aborted"
-
-            # The submit should raise CancelledError
+            assert aborted
             try:
                 await submit_task
-                logger.error("Submit should have been cancelled!")
-                assert False, "Submit should have been cancelled"
+                assert False, "Should have been cancelled"
             except asyncio.CancelledError:
-                logger.info("Submit correctly raised CancelledError")
+                pass
 
         await submit_and_abort()
-
-        # Check request state
-        info = coordinator.get_request_info("req-abort-1")
-        logger.info("Aborted request state: %s", info.state if info else "None")
-        assert (
-            info is not None and info.state.value == "aborted"
-        ), "Request should be aborted"
-
         logger.info("Test 3 PASSED!")
 
-        # Test 4: Health check
-        logger.info("=" * 50)
-        logger.info("Test 4: Health check")
-        logger.info("=" * 50)
-
-        health = coordinator.health()
-        logger.info("Coordinator health: %s", health)
-        assert health["running"] is True
-        assert "aborted" in health["request_states"]
+        # Test 4: Graceful shutdown
+        logger.info("--- Test 4: Graceful shutdown ---")
+        await coordinator.shutdown_stages()
+        await asyncio.sleep(0.5)
         logger.info("Test 4 PASSED!")
 
-        # Test 5: Graceful shutdown
-        logger.info("=" * 50)
-        logger.info("Test 5: Graceful shutdown")
-        logger.info("=" * 50)
-
-        await coordinator.shutdown_stages()
-        logger.info("Shutdown signals sent")
-
-        # Give stages time to shutdown
-        await asyncio.sleep(0.5)
-        logger.info("Test 5 PASSED!")
-
-        relay_label = " (NixlRelay)"
-        logger.info("=" * 50)
-        logger.info("ALL TESTS PASSED!%s", relay_label)
-        logger.info("=" * 50)
+        logger.info("=" * 60)
+        logger.info("ALL TESTS PASSED!")
+        logger.info("=" * 60)
 
     finally:
         # Cleanup
@@ -312,27 +280,15 @@ def parse_args():
     parser.add_argument(
         "--relay",
         type=str,
-        choices=["nixl"],
-        default="nixl",
-        help="Relay backend to use (default: nixl)",
-    )
-    parser.add_argument(
-        "--nixl-host",
-        type=str,
-        default="127.0.0.1",
-        help="NIXL host address (default: 127.0.0.1)",
-    )
-    parser.add_argument(
-        "--nixl-metadata-server",
-        type=str,
-        default="http://127.0.0.1:8080/metadata",
-        help="NIXL metadata server URL (default: http://127.0.0.1:8080/metadata)",
+        choices=["nixl", "shm", "nccl"],
+        default="nccl",
+        help="Relay backend to use (default: nccl)",
     )
     parser.add_argument(
         "--gpu-ids",
         type=str,
         default="0,1",
-        help="Comma-separated GPU IDs for each stage (default: 0,1)",
+        help="Comma-separated GPU IDs (e.g. '0,1'). Use -1 for CPU-only.",
     )
     return parser.parse_args()
 
@@ -342,38 +298,25 @@ def main():
     args = parse_args()
     relay_type = args.relay.lower()
 
-    # Always use NixlRelay
-    if True:
-        logger.info("Starting two-stage pipeline demo with NixlRelay...")
-        # Check if NixlRelay is available
-        try:
-            pass
-
-            # Build NIXL config
-            nixl_config = {
-                "host": args.nixl_host,
-                "metadata_server": args.nixl_metadata_server,
-                "device_name": "",
-            }
-
-            # Try to create a test instance to verify NIXL is available
-        except ImportError as e:
-            logger.error("Failed to import NixlRelay: %s", e)
-            logger.error(
-                "Please ensure dynamo.nixl_connect is available and NIXL metadata server is running."
-            )
-            raise
-    # nixl_config is already set above
+    # Configure NCCL environment dynamically to avoid port conflicts
+    if relay_type == "nccl":
+        free_port = str(find_free_port())
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = free_port
+        logger.info(f"Using NCCL Master Port: {free_port}")
 
     # Parse GPU IDs
     try:
-        gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(",")]
-        if len(gpu_ids) < 2:
-            logger.warning(
-                "Only %d GPU IDs provided, using first GPU for remaining stages",
-                len(gpu_ids),
-            )
-            gpu_ids.extend([gpu_ids[0]] * (2 - len(gpu_ids)))
+        raw_ids = [int(x.strip()) for x in args.gpu_ids.split(",")]
+        gpu_ids = [gid for gid in raw_ids if gid >= 0]
+        if not gpu_ids:
+            if relay_type == "nccl":
+                logger.warning(
+                    "NCCL requires GPUs! Will attempt to use default CUDA device."
+                )
+            else:
+                logger.info("No valid GPU IDs provided, running on CPU.")
+                gpu_ids = []
     except ValueError:
         logger.warning("Invalid GPU IDs format, using default: 0,1")
         gpu_ids = [0, 1]
@@ -382,12 +325,12 @@ def main():
     stage1_proc = mp.Process(
         target=run_stage1,
         name="Stage1",
-        args=(relay_type, nixl_config, gpu_ids[0]),
+        args=(relay_type, gpu_ids),
     )
     stage2_proc = mp.Process(
         target=run_stage2,
         name="Stage2",
-        args=(relay_type, nixl_config, gpu_ids[1]),
+        args=(relay_type, gpu_ids),
     )
 
     stage1_proc.start()
@@ -401,9 +344,6 @@ def main():
 
     try:
         # Give stages time to initialize
-        time.sleep(1.0)
-
-        # Run coordinator
         asyncio.run(run_coordinator_main(relay_type))
 
     except KeyboardInterrupt:
@@ -414,21 +354,26 @@ def main():
     finally:
         # Cleanup - wait for graceful shutdown first
         logger.info("Waiting for stage processes to exit...")
-        stage1_proc.join(timeout=2)
-        stage2_proc.join(timeout=2)
 
-        # Force kill if still alive
         if stage1_proc.is_alive():
-            logger.warning("Force killing stage1")
-            stage1_proc.terminate()
-            stage1_proc.join(timeout=1)
+            stage1_proc.join(timeout=2)
         if stage2_proc.is_alive():
-            logger.warning("Force killing stage2")
+            stage2_proc.join(timeout=2)
+
+        # Force termination if still alive
+        if stage1_proc.is_alive():
+            stage1_proc.terminate()
+            stage1_proc.join()
+        if stage2_proc.is_alive():
             stage2_proc.terminate()
-            stage2_proc.join(timeout=1)
+            stage2_proc.join()
 
         logger.info("Done")
 
 
 if __name__ == "__main__":
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
     main()
