@@ -3,12 +3,7 @@
 
 from __future__ import annotations
 
-from sglang_omni.config import (
-    ExecutorConfig,
-    PipelineConfig,
-    RelayConfig,
-    StageConfig,
-)
+from sglang_omni.config import ExecutorConfig, PipelineConfig, RelayConfig, StageConfig
 from sglang_omni.models.fishaudio_s1.pipeline.next_stage import (
     PREPROCESSING_STAGE,
     TTS_ENGINE_STAGE,
@@ -23,8 +18,8 @@ def create_tts_pipeline_config(
     vocoder_device: str = "cuda:0",
     max_new_tokens: int = 2048,
     max_seq_len: int = 4096,
-    use_compile: bool = False,
-    use_radix_cache: bool = False,
+    use_compile: bool = True,
+    use_radix_cache: bool = True,
     relay_type: str = "shm",
     fused_stages: list[list[str]] | None = None,
 ) -> PipelineConfig:

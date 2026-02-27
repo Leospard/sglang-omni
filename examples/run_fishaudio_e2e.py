@@ -3,7 +3,7 @@
 """FishAudio DualAR TTS via the sglang-omni pipeline.
 
 Usage:
-    # Text-only (no voice cloning):
+    # Text-only (compile + radix cache on by default):
     python examples/run_fishaudio_e2e.py --text "Hello, how are you today?"
 
     # With reference audio (voice cloning):
@@ -13,13 +13,11 @@ Usage:
     # Save output as wav:
     python examples/run_fishaudio_e2e.py --text "Hello" --output output.wav
 
-    # With torch.compile:
-    python examples/run_fishaudio_e2e.py --text "Hello" --compile --output output.wav
+    # Disable torch.compile:
+    python examples/run_fishaudio_e2e.py --text "Hello" --no-compile --output output.wav
 
-    # With voice cloning and radix cache:
-    python examples/run_fishaudio_e2e.py --text "Hello" \
-        --reference-audio ref.wav --reference-text "..." \
-        --use-radix-cache --output output.wav
+    # Disable radix cache:
+    python examples/run_fishaudio_e2e.py --text "Hello" --no-radix-cache --output output.wav
 """
 
 from __future__ import annotations
@@ -32,7 +30,7 @@ import time
 import soundfile as sf
 import torch
 
-from sglang_omni.config import compile_pipeline, PipelineRunner
+from sglang_omni.config import PipelineRunner, compile_pipeline
 from sglang_omni.models.fishaudio_s1 import create_tts_pipeline_config
 from sglang_omni.models.fishaudio_s1.io import FishAudioState
 from sglang_omni.proto import OmniRequest
@@ -48,17 +46,15 @@ async def run_e2e(args):
         tts_device=args.device,
         vocoder_device=args.device,
         max_new_tokens=args.max_new_tokens,
-        use_compile=args.compile,
-        use_radix_cache=args.use_radix_cache,
+        use_compile=not args.no_compile,
+        use_radix_cache=not args.no_radix_cache,
     )
 
     # -- 2. Compile & start ------------------------------------------------
     coordinator, stages = compile_pipeline(config)
     runner = PipelineRunner(coordinator, stages)
     await runner.start()
-    logger.info(
-        "Pipeline '%s' started (%d stages)", config.name, len(stages)
-    )
+    logger.info("Pipeline '%s' started (%d stages)", config.name, len(stages))
 
     try:
         if args.test_cache:
@@ -100,7 +96,7 @@ async def _run_single_request(coordinator, args):
     elapsed = time.perf_counter() - t0
 
     # Parse result
-    state = FishAudioState.from_dict(result.data)
+    state = FishAudioState.from_dict(result)
 
     if state.output_codes is not None:
         output_codes = state.output_codes
@@ -166,7 +162,7 @@ async def _run_cache_test(coordinator, args):
         result = await coordinator.submit(request_id, request)
 
         elapsed = time.perf_counter() - t0
-        state = FishAudioState.from_dict(result.data)
+        state = FishAudioState.from_dict(result)
 
         if state.output_codes is not None:
             output_codes = state.output_codes
@@ -213,10 +209,10 @@ def main():
         help="Path to save output wav",
     )
     parser.add_argument(
-        "--use-radix-cache",
+        "--no-radix-cache",
         action="store_true",
         default=False,
-        help="Enable radix-tree prefix cache for voice ref reuse",
+        help="Disable radix-tree prefix cache (on by default)",
     )
     parser.add_argument(
         "--test-cache",
@@ -225,10 +221,10 @@ def main():
         help="Run cache correctness test: 2 requests with same voice ref, different text",
     )
     parser.add_argument(
-        "--compile",
+        "--no-compile",
         action="store_true",
         default=False,
-        help="Use torch.compile(mode='reduce-overhead') for decode steps",
+        help="Disable torch.compile for decode steps (on by default)",
     )
     args = parser.parse_args()
 

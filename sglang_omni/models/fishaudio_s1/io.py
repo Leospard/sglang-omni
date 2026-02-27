@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -21,8 +21,8 @@ class FishAudioState:
     input_values: Any = None  # [num_codebooks+1, seq_len] as nested list
     audio_masks: Any | None = None
     audio_parts: Any | None = None
-    num_codebooks: int = 4
-    codebook_size: int = 1024
+    num_codebooks: int = 10
+    codebook_size: int = 4096
 
     # -- Generation params -------------------------------------------------
     max_new_tokens: int = 1024
@@ -82,8 +82,8 @@ class FishAudioState:
             input_values=data.get("input_values"),
             audio_masks=data.get("audio_masks"),
             audio_parts=data.get("audio_parts"),
-            num_codebooks=data.get("num_codebooks", 4),
-            codebook_size=data.get("codebook_size", 1024),
+            num_codebooks=data.get("num_codebooks", 10),
+            codebook_size=data.get("codebook_size", 4096),
             max_new_tokens=data.get("max_new_tokens", 1024),
             temperature=data.get("temperature", 0.8),
             top_p=data.get("top_p", 0.8),

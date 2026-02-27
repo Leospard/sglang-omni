@@ -106,7 +106,10 @@ def create_preprocessing_executor(model_id: str) -> PreprocessingExecutor:
 
     from fish_speech.tokenizer import FishTokenizer
 
-    from sglang_omni.models.fishaudio_s1.tokenizer import FishTokenizerAdapter, Reference
+    from sglang_omni.models.fishaudio_s1.tokenizer import (
+        FishTokenizerAdapter,
+        Reference,
+    )
 
     tokenizer = FishTokenizer.from_pretrained(checkpoint_dir)
     adapter = FishTokenizerAdapter(tokenizer)
@@ -128,9 +131,7 @@ def create_preprocessing_executor(model_id: str) -> PreprocessingExecutor:
             audio = audio.mean(0, keepdim=True)
         audio = torchaudio.functional.resample(audio, sr, codec.sample_rate)
         audios = audio[None].to(device)
-        audio_lengths = torch.tensor(
-            [audios.shape[2]], device=device, dtype=torch.long
-        )
+        audio_lengths = torch.tensor([audios.shape[2]], device=device, dtype=torch.long)
         with torch.no_grad():
             indices, _ = codec.encode(audios, audio_lengths)
             if indices.ndim == 3:
@@ -141,13 +142,27 @@ def create_preprocessing_executor(model_id: str) -> PreprocessingExecutor:
         inputs = payload.request.inputs or {}
         params = payload.request.params or {}
 
+        # Support raw string inputs from the speech API
+        if isinstance(inputs, str):
+            inputs = {"text": inputs}
+
         text = inputs.get("text", "")
-        num_codebooks = inputs.get("num_codebooks", 4)
-        codebook_size = inputs.get("codebook_size", 1024)
+        num_codebooks = inputs.get("num_codebooks", 10)
+        codebook_size = inputs.get("codebook_size", 4096)
 
         # Build voice-cloning references
         references: list[Reference] | None = None
         raw_refs = inputs.get("references")
+
+        # Fall back to metadata tts_params for voice cloning via speech API
+        if not raw_refs:
+            metadata = payload.request.metadata or {}
+            tts_params = metadata.get("tts_params", {})
+            ref_audio = tts_params.get("ref_audio")
+            if ref_audio:
+                raw_refs = [
+                    {"audio_path": ref_audio, "text": tts_params.get("ref_text", "")}
+                ]
         if raw_refs:
             references = []
             for ref_data in raw_refs:
@@ -272,9 +287,7 @@ def create_vocoder_executor(
 
         # output_codes: [num_codebooks+1, T] — rows 1..N are codebook indices
         codebook_codes = output_codes[1:].to(device)  # [num_codebooks, T]
-        feature_lengths = torch.tensor(
-            [codebook_codes.shape[1]], device=device
-        )
+        feature_lengths = torch.tensor([codebook_codes.shape[1]], device=device)
 
         with torch.no_grad():
             audio, _ = codec.decode(codebook_codes[None], feature_lengths)
@@ -282,6 +295,12 @@ def create_vocoder_executor(
         audio_np = audio[0, 0].float().cpu()
         state.audio_samples = audio_np
         state.sample_rate = codec.sample_rate
-        return store_state(payload, state)
+        payload = store_state(payload, state)
+
+        # Add keys expected by the generic Client result builder.
+        # Must be serialisable (no Tensor) since this goes via msgpack.
+        payload.data["audio_data"] = audio_np.tolist()
+        payload.data["modality"] = "audio"
+        return payload
 
     return PreprocessingExecutor(_vocode)
