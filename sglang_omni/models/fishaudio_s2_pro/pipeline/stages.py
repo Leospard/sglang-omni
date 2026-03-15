@@ -208,6 +208,8 @@ def create_sglang_tts_engine_executor(
     device: str = "cuda",
     max_new_tokens: int = 2048,
     top_k: int = 30,
+    use_torch_compile: bool = True,
+    enable_cuda_graph: bool = True,
 ) -> EngineExecutor:
     """Factory for the S2-Pro TTS engine stage."""
     from sglang.srt.server_args import ServerArgs
@@ -230,7 +232,9 @@ def create_sglang_tts_engine_executor(
         mem_fraction_static=0.85,
         chunked_prefill_size=8192,
         max_running_requests=64,
-        disable_cuda_graph=True,
+        disable_cuda_graph=not enable_cuda_graph,
+        disable_radix_cache=False,
+        attention_backend="fa3",
     )
 
     engine = create_s2pro_sglang_engine(
@@ -242,6 +246,7 @@ def create_sglang_tts_engine_executor(
         codebook_size=codebook_size,
         max_new_tokens=max_new_tokens,
         top_k=top_k,
+        use_torch_compile=use_torch_compile,
     )
 
     def _request_builder(payload: StagePayload):

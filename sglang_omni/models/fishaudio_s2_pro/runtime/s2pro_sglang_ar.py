@@ -430,23 +430,24 @@ class S2ProSGLangModelRunner:
             semantic_begin = self.output_processor._semantic_begin_id
             semantic_end = self.output_processor._semantic_end_id
 
-            for i, sched_req in enumerate(scheduler_output.requests):
+            # Vectorized check for semantic tokens
+            is_semantic_mask = (input_ids >= semantic_begin) & (input_ids <= semantic_end)
+            
+            # Only process requests with semantic tokens
+            semantic_indices = is_semantic_mask.nonzero(as_tuple=True)[0]
+            
+            for i in semantic_indices:
+                sched_req = scheduler_output.requests[i]
                 data: S2ProSGLangRequestData = sched_req.data
                 if data._last_codebook_values is not None:
-                    token_id = input_ids[i]
-                    is_semantic = (token_id >= semantic_begin) & (
-                        token_id <= semantic_end
+                    vq_parts = data._last_codebook_values.to(device).unsqueeze(0)
+                    token_embed = text_embeds[i : i + 1]
+                    combined = audio_decoder.embed_one_token(
+                        token_embed,
+                        vq_parts,
+                        torch.tensor([True], device=device),
                     )
-
-                    if is_semantic:
-                        vq_parts = data._last_codebook_values.to(device).unsqueeze(0)
-                        token_embed = text_embeds[i : i + 1]
-                        combined = audio_decoder.embed_one_token(
-                            token_embed,
-                            vq_parts,
-                            torch.tensor([True], device=device),
-                        )
-                        text_embeds[i] = combined.squeeze(0)
+                    text_embeds[i] = combined.squeeze(0)
 
         model_worker_batch.input_embeds = text_embeds
 
