@@ -80,6 +80,7 @@ class DualARRadixCache:
         self._root = TreeNode()
         self._max_tokens = max_tokens
         self._total_tokens = 0
+        self._leaves: set[TreeNode] = set()
 
         # Observability counters
         self._num_matches = 0  # match_prefix calls that returned kv_data
@@ -90,6 +91,39 @@ class DualARRadixCache:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def _match_path(
+        self, tokens: tuple[int, ...]
+    ) -> tuple[TreeNode, int, int]:
+        """Find the longest matching path in the tree.
+        
+        Returns:
+            node: the deepest node reached (could be a partial edge match).
+            pos: number of tokens matched before this node's edge.
+            match_len: number of tokens matched on this node's edge.
+        """
+        node = self._root
+        pos = 0
+
+        while pos < len(tokens):
+            child = node.children.get(tokens[pos])
+            if child is None:
+                break
+
+            edge_tokens = child.key
+            match_len = 0
+            for i, et in enumerate(edge_tokens):
+                if pos + i >= len(tokens) or tokens[pos + i] != et:
+                    break
+                match_len += 1
+
+            if match_len < len(edge_tokens):
+                return child, pos, match_len
+
+            node = child
+            pos += match_len
+
+        return node, pos, 0
 
     def match_prefix(
         self, tokens: list[int] | torch.Tensor
@@ -108,49 +142,35 @@ class DualARRadixCache:
         """
         if isinstance(tokens, torch.Tensor):
             tokens = tokens.tolist()
+        tokens_tuple = tuple(tokens)
 
-        node = self._root
-        best_matched = 0
-        best_kv: list[tuple[Tensor, Tensor]] | None = None
-        best_node = self._root
-        pos = 0
+        node, pos, match_len = self._match_path(tokens_tuple)
 
-        while pos < len(tokens):
-            token = tokens[pos]
-            child = node.children.get(token)
-            if child is None:
-                break
+        if match_len > 0:
+            # Partial edge match — split to create a node boundary
+            # so KV data (propagated by _split_node) can be returned.
+            node = self._split_node(node, match_len)
+            pos += match_len
 
-            edge_tokens = child.key
-            match_len = 0
-            for i, et in enumerate(edge_tokens):
-                if pos + i >= len(tokens) or tokens[pos + i] != et:
-                    break
-                match_len += 1
+        # Now find the deepest node with kv_data
+        best_node = node
+        best_matched = pos
+        while best_node is not None and best_node.kv_data is None:
+            best_matched -= len(best_node.key)
+            best_node = best_node.parent
 
-            if match_len == 0:
-                break
+        if best_node is None or best_node is self._root:
+            best_matched = 0
+            best_kv = None
+            best_node = self._root
+        else:
+            best_kv = best_node.kv_data
 
-            if match_len == len(edge_tokens):
-                # Full edge match — descend
-                node = child
-                pos += match_len
-                node.last_access_time = time.monotonic()
-                if node.kv_data is not None:
-                    best_kv = node.kv_data
-                    best_node = node
-                    best_matched = pos
-            else:
-                # Partial edge match — split to create a node boundary
-                # so KV data (propagated by _split_node) can be returned.
-                mid = self._split_node(child, match_len)
-                pos += match_len
-                mid.last_access_time = time.monotonic()
-                if mid.kv_data is not None:
-                    best_kv = mid.kv_data
-                    best_node = mid
-                    best_matched = pos
-                break
+        # Update access times along the matched path
+        curr = node
+        while curr is not None and curr is not self._root:
+            curr.last_access_time = time.monotonic()
+            curr = curr.parent
 
         # Update stats
         self._total_query_tokens += len(tokens)
@@ -193,74 +213,47 @@ class DualARRadixCache:
         if not tokens:
             return 0
 
-        node = self._root
-        pos = 0
+        tokens_tuple = tuple(tokens)
+        node, pos, match_len = self._match_path(tokens_tuple)
+
+        # Determine already_cached length before we modify the tree
         already_cached = 0
+        curr = node.parent if match_len > 0 else node
+        curr_pos = pos
+        
+        while curr is not None and curr is not self._root:
+            if curr.kv_data is not None:
+                already_cached = curr_pos
+                break
+            curr_pos -= len(curr.key)
+            curr = curr.parent
 
-        while pos < len(tokens):
-            token = tokens[pos]
-            child = node.children.get(token)
+        if match_len > 0:
+            node = self._split_node(node, match_len)
+            pos += match_len
 
-            if child is None:
-                remaining = tuple(tokens[pos:])
-                new_tokens = len(remaining)
-                if not self._evict_to_fit(new_tokens):
-                    return already_cached  # cache full, refuse insert
+        if pos < len(tokens):
+            remaining = tokens_tuple[pos:]
+            new_tokens = len(remaining)
+            if not self._evict_to_fit(new_tokens):
+                return already_cached  # cache full, refuse insert
 
-                new_node = TreeNode(
-                    parent=node,
-                    key=remaining,
-                    kv_data=kv_data,
-                    depth=node.depth + new_tokens,
-                    last_access_time=time.monotonic(),
-                )
-                node.children[token] = new_node
-                self._total_tokens += new_tokens
-                return already_cached
-
-            edge_tokens = child.key
-            match_len = 0
-            for i, et in enumerate(edge_tokens):
-                if pos + i >= len(tokens) or tokens[pos + i] != et:
-                    break
-                match_len += 1
-
-            if match_len == len(edge_tokens):
-                # Full edge match — descend
-                node = child
-                pos += match_len
-                if node.kv_data is not None:
-                    already_cached = pos
-            else:
-                # Partial match — split and insert remainder
-                mid_node = self._split_node(child, match_len)
-                pos += match_len
-
-                rest_new = tuple(tokens[pos:])
-                if rest_new:
-                    new_tokens = len(rest_new)
-                    if not self._evict_to_fit(new_tokens):
-                        return already_cached  # cache full, refuse insert
-
-                    new_node = TreeNode(
-                        parent=mid_node,
-                        key=rest_new,
-                        kv_data=kv_data,
-                        depth=mid_node.depth + new_tokens,
-                        last_access_time=time.monotonic(),
-                    )
-                    mid_node.children[rest_new[0]] = new_node
-                    self._total_tokens += new_tokens
-                else:
-                    # Exact match at split point — store data here
-                    mid_node.kv_data = kv_data
-                    mid_node.last_access_time = time.monotonic()
-                return already_cached
-
-        # Exact match of entire sequence — update existing node
-        node.kv_data = kv_data
-        node.last_access_time = time.monotonic()
-        already_cached = pos
+            new_node = TreeNode(
+                parent=node,
+                key=remaining,
+                kv_data=kv_data,
+                depth=node.depth + new_tokens,
+                last_access_time=time.monotonic(),
+            )
+            node.children[remaining[0]] = new_node
+            self._leaves.add(new_node)
+            self._leaves.discard(node)
+            self._total_tokens += new_tokens
+        else:
+            # Exact match of entire sequence — update existing node
+            node.kv_data = kv_data
+            node.last_access_time = time.monotonic()
+            
         return already_cached
 
     def inc_lock_ref(self, node: TreeNode) -> None:
@@ -307,6 +300,7 @@ class DualARRadixCache:
         """Remove all cached entries."""
         self._root = TreeNode()
         self._total_tokens = 0
+        self._leaves.clear()
 
     @property
     def total_tokens(self) -> int:
@@ -351,17 +345,7 @@ class DualARRadixCache:
 
     def _count_leaves(self) -> int:
         """Count leaf nodes with KV data."""
-        count = 0
-
-        def _walk(node: TreeNode) -> None:
-            nonlocal count
-            if node.kv_data is not None:
-                count += 1
-            for child in node.children.values():
-                _walk(child)
-
-        _walk(self._root)
-        return count
+        return sum(1 for leaf in self._leaves if leaf.kv_data is not None)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -418,16 +402,11 @@ class DualARRadixCache:
         best: TreeNode | None = None
         best_time = float("inf")
 
-        def _walk(node: TreeNode) -> None:
-            nonlocal best, best_time
-            if node.is_leaf and node is not self._root and node.lock_ref == 0:
-                if node.last_access_time < best_time:
-                    best_time = node.last_access_time
-                    best = node
-            for child in node.children.values():
-                _walk(child)
+        for leaf in self._leaves:
+            if leaf.lock_ref == 0 and leaf.last_access_time < best_time:
+                best_time = leaf.last_access_time
+                best = leaf
 
-        _walk(self._root)
         return best
 
     def _remove_leaf(self, leaf: TreeNode) -> int:
@@ -441,6 +420,10 @@ class DualARRadixCache:
         first_token = leaf.key[0]
         if first_token in parent.children and parent.children[first_token] is leaf:
             del parent.children[first_token]
+            
+        self._leaves.discard(leaf)
+        if not parent.children and parent is not self._root:
+            self._leaves.add(parent)
 
         leaf.kv_data = None
         leaf.parent = None
